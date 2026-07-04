@@ -1,64 +1,283 @@
-# Main entrypoint of the workflow. 
-# Please follow the best practices: 
-# https://snakemake.readthedocs.io/en/stable/snakefiles/best_practices.html,
-# in particular regarding the standardized folder structure mentioned there. 
+# Chromosome-parallelised germline variant calling workflow.
+# Alternative to rakeiora-public-germline's whole-genome, single-pass workflow.
+# Authors: Ben Curran/Peter Tsai/Matt Pestle
+# Date: Jun 2026
+#
+# Assumes input BAMs (resources/{sample}.bam) are already coordinate-sorted and
+# duplicate-free (no MarkDuplicates/sort/index steps are performed here).
+# Also assumes indexes (*.bai) are present for all bam files.
+# Runs VarScan mpileup2snp AND mpileup2indel per chromosome, then merges.
+# Does not include annotate/filter stages.
+#
+# Try running this on a VM with N cpus and giving snakemake 2N cores
+# So if cpuinfo shows a count of 4, try
+#      snakemake -c8 --use-singularity
+# Timings:
+# 4cpu Rakeiora system with 8 snakemake cores  : Under 5hrs for a sample
+# 16cpu Rakeiora system with 16 snakemake cores: Under 3hrs for a sample
 
-configfile: "config/inputs.yaml"
-sampleName, = glob_wildcards("resources/{id}.bam") # Bam files to iterate across
+configfile: "config/inputs.new.yaml"
+#
+rawDataDirectory      = config["rawDataDirectory"]
+intermediateDirectory = config["intermediateDirectory"]
+resultsDirectory      = config["resultsDirectory"]
+referenceDirectory    = config["referenceDirectory"]
+referenceFile         = config["referenceFile"]
+singularityDirectory  = config["singularityDirectory"]
+libDirectory          = config["libDirectory"]
+metricsDirectory      = config["metricsDirectory"]
+logsDirectory         = config["logsDirectory"]
+workflowSingularity   = config["workflowSingularity"]
+varscanLib            = config["varscanLib"]
+#
+# Sample names are derived from whatever BAMs are present, same convention as
+# rakeiora-public-germline's Snakefile.
+sampleName, = glob_wildcards(rawDataDirectory + "/{id}.bam")
+#
+# Outputs:
+varscanSnpVcf         = intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf",
+varscanSnpVcfgz       = intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf.gz",
+varscanSnpVcfgzCsi    = intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf.gz.csi",
+varscanIndelVcf       = intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf",
+varscanIndelVcfgz     = intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf.gz",
+varscanIndelVcfgzCsi  = intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf.gz.csi",
+mergedVCF             = resultsDirectory      + "/{sample}.merged.vcf.gz"
+decomposedVCF         = resultsDirectory      + "/{sample}.decomposed.vcf"
+normalisedVCF         = resultsDirectory      + "/{sample}.normalised.vcf"
+normalisedVCFgz       = resultsDirectory      + "/{sample}.normalised.vcf.gz"
+normalisedVCFgztbi    = resultsDirectory      + "/{sample}.normalised.vcf.gz.tbi"
 
-singularity_samtools = config["singularity_samtools"]
-singularity_java     = config["singularity_java"]
-singularity_vt       = config["singularity_vt"]
-singularity_vt2      = config["singularity_vt2"]
-varscanLib           = config["varscanLib"]
-picardLib            = config["picardLib"]
-referenceFile        = config["referenceFile"]
-vcfannoConfig        = config["vcfannoConfig"]
 
-bamBaiFiles          = "resources/{sample}.bam.bai"
-normalizedVCF        = "results/{sample}.normalised.vcf"
-normalizedVCFgz      = "results/{sample}.normalised.vcf.gz"
-normalizedVCFgztbi   = "results/{sample}.normalised.vcf.gz.tbi"
-annotatedVCF         = "results/{sample}.annotated.vcf"
-filteredVCF          = "results/{sample}.filtered.vcf"
-dupFiles             = "int/{sample}.markDuplicates.bam"
-sortedFiles          = "int/{sample}.markDuplicates.sorted.bam"
-sortedBamFiles       = "int/{sample}.markDuplicates.sorted.bam.bai"
-pileupFiles          = "int/{sample}.pileup"
-varscanFiles         = "int/{sample}.varscan.germline.vcf"
-decompFiles          = "int/{sample}.decomposed.vcf"
-normalisedFiles      = "int/{sample}.normalised.vcf"
-normalisedGzFiles    = "int/{sample}.normalised.vcf.gz"
-normalisedGzTbiFiles = "int/{sample}.normalised.vcf.gz.tbi"
-annotatedFiles       = "results/{sample}.annotated.vcf"
-filteredFiles        = "results/{sample}.filtered.vcf"
+#################################################################################
+################ SINGULARITY_BIND environment variable ##########################
+#################################################################################
+# The Singularity needs access to some file systems, which need to be specified
+# here in the SINGULARITY_BIND environment variable.
+# It needs to see the /shared file system and wherever raw data is mounted
+# so that the symlinks to files on that data system can be followed.
+# So in the calling environment:
+# export SINGULARITY_BIND=/shared,/path/to/data
+envvars:
+    "SINGULARITY_BIND"
+#################################################################################
 
-all_results = expand([bamBaiFiles], sample = sampleName) \
-	,expand([dupFiles], sample = sampleName) \
-	,expand([sortedFiles], sample = sampleName) \
-	,expand([sortedBamFiles], sample = sampleName) \
-	,expand([pileupFiles], sample = sampleName) \
-	,expand([varscanFiles], sample = sampleName) \
-	,expand([decompFiles], sample = sampleName) \
-	,expand([normalisedFiles], sample = sampleName) \
-	,expand([normalisedGzFiles], sample = sampleName) \
-	,expand([normalisedGzTbiFiles], sample = sampleName) \
-	,expand([annotatedFiles], sample = sampleName) \
-	,expand([filteredFiles], sample = sampleName) \
+# We will achieve parallelisation by partitioning into the 25 different chromosomes
+# and letting snakemake handle processes that can be run concurrently.
+CHROMOSOMES = [f"chr{i}" for i in range(1, 23)]
+CHROMOSOMES = CHROMOSOMES + ["chrM","chrX","chrY"]
+
+# Currently desired outputs - probably more than is required
+all_results = [
+	 expand(varscanSnpVcf, sample=sampleName, chr=CHROMOSOMES)
+	,expand(varscanSnpVcfgz, sample=sampleName, chr=CHROMOSOMES)
+	,expand(varscanSnpVcfgzCsi, sample=sampleName, chr=CHROMOSOMES)
+	,expand(varscanIndelVcf, sample=sampleName, chr=CHROMOSOMES)
+	,expand(varscanIndelVcfgz, sample=sampleName, chr=CHROMOSOMES)
+	,expand(varscanIndelVcfgzCsi, sample=sampleName, chr=CHROMOSOMES)
+	,expand(mergedVCF, sample=sampleName)
+	,expand(decomposedVCF, sample=sampleName)
+	,expand(normalisedVCF, sample=sampleName)
+	,expand(normalisedVCFgz, sample=sampleName)
+	,expand(normalisedVCFgztbi, sample=sampleName)
+	]
 
 rule all:
     input:
         all_results
 
-#include: "rules/r1.smk"
-include: "rules/index.smk"
-include: "rules/markDuplicates.smk"
-include: "rules/markDuplicatesSort.smk"
-include: "rules/markDuplicatesSortIndex.smk"
-include: "rules/germlinePileup.smk"
-include: "rules/varscan.smk"
-include: "rules/decompose.smk"
-include: "rules/normalise.smk"
-include: "rules/normaliseIndex.smk"
-include: "rules/annotate.smk"
-include: "rules/filter.smk"
+####################### pileup and varscan pipe ###################################
+rule varscanGermlineSnp:
+    input:
+        bam = rawDataDirectory   + "/{sample}.bam",
+        reference = referenceDirectory + "/" + referenceFile,
+        varscanlib = libDirectory + "/" + varscanLib
+    output:
+        varscanSnpVcf   = intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf",
+    log:
+        logsDirectory + "/{sample}.{chr}.varscanGermlineSnp.log"
+#    resources:
+#        mem = "16GB",
+#        time = "10:00:00"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+	now=$(date '+%Y%m%d-%H%M%S')
+	echo "$now starting {wildcards.sample} {wildcards.chr}" >> logs/progress.log
+
+	samtools mpileup \
+	-r {wildcards.chr} \
+	-B \
+	-d 9001 \
+	-q 1 \
+	-f {input.reference} \
+	{input.bam} \
+	| \
+	java \
+	-jar {input.varscanlib} mpileup2snp \
+	--min-var-freq 0.1 \
+	--p-value 1.00 \
+	--strand-filter 0 \
+	--output-vcf 1 \
+	--min-coverage 10 \
+	--mpileup 1 > {output.varscanSnpVcf}
+
+	>{log} 2>&1
+
+	now=$(date '+%Y%m%d-%H%M%S')
+	echo "$now finished {wildcards.sample} {wildcards.chr} $SECONDS" >> logs/progress.log
+        """
+
+rule varscanGermlineIndel:
+    input:
+        bam = rawDataDirectory   + "/{sample}.bam",
+        reference = referenceDirectory + "/" + referenceFile,
+        varscanlib = libDirectory + "/" + varscanLib
+    output:
+        varscanIndelVcf   = intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf",
+    log:
+        logsDirectory + "/{sample}.{chr}.varscanGermlineIndel.log"
+#    resources:
+#        mem = "16GB",
+#        time = "10:00:00"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+	now=$(date '+%Y%m%d-%H%M%S')
+	echo "$now starting {wildcards.sample} {wildcards.chr}" >> logs/progress.log
+
+	samtools mpileup \
+	-r {wildcards.chr} \
+	-B \
+	-d 9001 \
+	-q 1 \
+	-f {input.reference} \
+	{input.bam} \
+	| \
+	java \
+	-jar {input.varscanlib} mpileup2indel \
+	--min-var-freq 0.1 \
+	--p-value 1.00 \
+	--strand-filter 0 \
+	--output-vcf 1 \
+	--min-coverage 10 \
+	--mpileup 1 > {output.varscanIndelVcf}
+
+	>{log} 2>&1
+
+	now=$(date '+%Y%m%d-%H%M%S')
+	echo "$now finished {wildcards.sample} {wildcards.chr} $SECONDS" >> logs/progress.log
+        """
+
+###################################### Gzip snp varscans ######################################
+rule GzipSnp:
+    input:
+        f = rules.varscanGermlineSnp.output.varscanSnpVcf
+    output:
+        vcfgz =  rules.varscanGermlineSnp.output.varscanSnpVcf + ".gz"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+            bgzip -c {input.f} > {input.f}.gz
+        """
+
+###################################### Gzip indel varscans ######################################
+rule GzipIndel:
+    input:
+        f = rules.varscanGermlineIndel.output.varscanIndelVcf
+    output:
+        vcfgz =  rules.varscanGermlineIndel.output.varscanIndelVcf + ".gz"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+            bgzip -c {input.f} > {input.f}.gz
+        """
+
+###################################### Gzip snp index ######################################
+rule GzipSnpIndex:
+    input:
+        f = rules.GzipSnp.output.vcfgz
+    output:
+        vcfcsi =  rules.GzipSnp.output.vcfgz + ".csi"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+            bcftools index {input.f}
+        """
+###################################### Gzip indel index ######################################
+rule GzipIndelIndex:
+    input:
+        f = rules.GzipIndel.output.vcfgz
+    output:
+        vcfcsi =  rules.GzipIndel.output.vcfgz + ".csi"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+            bcftools index {input.f}
+        """
+################################ Concat snp and indel ################################
+rule Concat:
+    input:
+        fs   = lambda wildcards: expand(intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf.gz", sample=[wildcards.sample], chr=CHROMOSOMES),
+        fi   = lambda wildcards: expand(intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf.gz", sample=[wildcards.sample], chr=CHROMOSOMES),
+        fndx = lambda wildcards: expand(intermediateDirectory + "/{sample}.{chr}.varscan.germline.indel.vcf.gz.csi", sample=[wildcards.sample], chr=CHROMOSOMES),
+        fsdx = lambda wildcards: expand(intermediateDirectory + "/{sample}.{chr}.varscan.germline.snp.vcf.gz.csi", sample=[wildcards.sample], chr=CHROMOSOMES)
+    output:
+        vcf =  mergedVCF
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+            bcftools concat -a {input.fs} {input.fi} | \
+		bcftools sort --write-index -Oz -o {output.vcf}
+        """
+##################################### Decompose ######################################
+rule decompose:
+    input:
+        vcf = rules.Concat.output.vcf
+    output:
+        vcf = decomposedVCF
+    log:
+        decompositionLog = "logs/{sample}.decomposition.log"
+#    resources:
+#        mem = "8GB",
+#        time = "01:00:00"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+        vt decompose -s {input.vcf} -o {output.vcf} > {log.decompositionLog}
+        """
+##################################### Normalise ######################################
+rule normalise:
+    input:
+        reference = referenceDirectory + "/" + referenceFile,
+        vcf = rules.decompose.output.vcf
+    output:
+        vcf = normalisedVCF
+    log:
+        normalisationLog = "logs/{sample}.normalised.log"
+#    resources:
+#        mem = "8GB",
+#        time = "01:00:00"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+        vt normalize {input.vcf} -r {input.reference} -o  {output.vcf} > {log.normalisationLog}
+        """
+##################################### Normalise_index vcf calls ######################################################
+rule normalise_index:
+    input:
+        vcf = rules.normalise.output.vcf
+    output:
+        vcfgz = normalisedVCFgz,
+        vcftbi = normalisedVCFgztbi
+    log:
+        normalisationLog = "logs/{sample}.normalisedndx.log"
+    threads:
+        4
+#    resources:
+#        mem = "80GB",
+#        time = "01:00:00"
+    container: singularityDirectory + "/" + workflowSingularity
+    shell:
+        """
+        bgzip -@ {threads} -c {input.vcf} > {output.vcfgz} && tabix -p vcf {output.vcfgz}
+        """
