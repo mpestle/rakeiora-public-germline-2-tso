@@ -260,7 +260,7 @@ rule normalise:
     container: singularityDirectory + "/" + workflowSingularity
     shell:
         """
-        vt normalize {input.vcf} -r {input.reference} -o  {output.vcf} > {log.normalisationLog}
+        vt normalize {input.vcf} -r {input.reference} -n -o  {output.vcf} > {log.normalisationLog}
         """
 ##################################### Normalise_index vcf calls ######################################################
 rule normalise_index:
